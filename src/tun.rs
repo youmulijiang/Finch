@@ -22,11 +22,12 @@
 
 use crate::state::SharedState;
 
-/// Capture filter: empty = every process; otherwise case-insensitive
-/// substring match of any entry against the process name.
+/// Hijack list match: true when `proc_name` contains any list entry
+/// (case-insensitive). An EMPTY list hijacks NOTHING — every flow is only
+/// relayed directly until the user toggles a process on.
 pub fn process_matches(filter: &[String], proc_name: &str) -> bool {
     if filter.is_empty() {
-        return true;
+        return false;
     }
     let n = proc_name.to_lowercase();
     filter
@@ -399,47 +400,140 @@ mod engine {
     ) {
         let dst = tcp.local_addr();
         let client = tcp.peer_addr();
-        let proc_name = lookup_process(&snapshot, 1, client, dst.port());
+        let mut tcp = tcp;
+        use tokio::io::AsyncWriteExt;
 
-        // Decide the path: Finch itself and unknown/filtered-out processes
-        // are relayed directly (bound to the physical interface so they do
-        // not loop back into the TUN); matching processes go through the
-        // local proxy.
+        // 1. Sniff the protocol first. This doubles as a grace period: the
+        // client must speak (TLS/HTTP/its protocol) before we need the
+        // process verdict, by which time the socket-table poller (300 ms
+        // cadence) has seen the connection.
+        let sniffed = match sniff_target(&mut tcp, dst).await {
+            Ok(s) => s,
+            Err(e) => {
+                record_event(&shared, &client, &dst, None, &format!("sniff failed: {e}"));
+                let _ = tcp.shutdown().await;
+                return;
+            }
+        };
+
+        // 2. Process lookup with a short retry — the table snapshot lags the
+        // SYN by up to one poll interval.
+        let proc_name = wait_lookup_process(&snapshot, client, dst.port()).await;
+
+        // 3. Decide the path. Only explicitly hijacked processes go through
+        // the proxy; everything else (unknown process, non-HTTP/TLS
+        // protocol, Finch itself) is relayed directly with the bytes the
+        // sniff already consumed replayed up front.
         let filter = shared.settings.lock().unwrap().tun_process_filter.clone();
         let capture = match &proc_name {
             Some(name) => !is_self_process(name) && process_matches(&filter, name),
             None => false,
         };
 
-        if capture {
-            if let Err(e) = proxy_flow(tcp, &shared, proc_name.as_deref(), dst, proxy_port).await {
-                tracing::debug!("[TUN] proxied flow to {dst} failed: {e}");
+        let path = if capture && sniffed.target.is_some() {
+            if let Err(e) = proxy_flow(
+                &mut tcp,
+                &shared,
+                proc_name.as_deref(),
+                proxy_port,
+                sniffed.target.as_deref().unwrap(),
+                sniffed.buffered,
+            )
+            .await
+            {
+                record_event(
+                    &shared,
+                    &client,
+                    &dst,
+                    proc_name.as_deref(),
+                    &format!("proxy FAILED: {e}"),
+                );
+                return;
             }
+            "proxy"
         } else {
             use tokio::io::AsyncWriteExt;
             let mut up = match dial_direct(dst, phys_ip) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!("[TUN] direct dial {dst} failed: {e}");
+                    record_event(
+                        &shared,
+                        &client,
+                        &dst,
+                        proc_name.as_deref(),
+                        &format!("direct dial failed: {e}"),
+                    );
                     return;
                 }
             };
-            let mut tcp = tcp;
+            if !sniffed.buffered.is_empty() {
+                if up.write_all(&sniffed.buffered).await.is_err() {
+                    let _ = up.shutdown().await;
+                    return;
+                }
+            }
             let _ = copy_bidirectional(&mut tcp, &mut up).await;
             let _ = up.shutdown().await;
-        }
+            if capture {
+                // Hijacked but the protocol is not HTTP/TLS: the proxy has no
+                // way to speak it, so it was relayed directly.
+                "direct (non-HTTP/TLS protocol)"
+            } else {
+                "direct"
+            }
+        };
+        record_event(&shared, &client, &dst, proc_name.as_deref(), path);
     }
 
-    /// Shim: sniff SNI/Host, CONNECT to the local proxy, then pipe.
-    async fn proxy_flow(
-        mut tcp: ipstack::IpStackTcpStream,
+    /// Push a flow decision onto the TUN tab's recent-flows log (newest
+    /// first, capped).
+    fn record_event(
+        shared: &Arc<SharedState>,
+        client: &SocketAddr,
+        dst: &SocketAddr,
+        proc_name: Option<&str>,
+        path: &str,
+    ) {
+        let line = format!(
+            "{} → {}  [{}] {}",
+            client,
+            dst,
+            proc_name.unwrap_or("?"),
+            path
+        );
+        tracing::debug!("[TUN] {line}");
+        let mut ev = shared.tun_events.lock().unwrap();
+        ev.push_front(line);
+        ev.truncate(50);
+    }
+
+    /// Lookup with retry: the OS socket table is polled every 300 ms, but a
+    /// flow's SYN may land just before a snapshot refresh. Wait up to ~1 s
+    /// total before concluding the process is unknown.
+    async fn wait_lookup_process(
+        snapshot: &ProcSnapshot,
+        client: SocketAddr,
+        dst_port: u16,
+    ) -> Option<String> {
+        for _ in 0..10 {
+            if let Some(name) = lookup_process(snapshot, 1, client, dst_port) {
+                return Some(name);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    /// Shim: sniff SNI/Host, CONNECT to the local proxy, then pipe. The
+    /// bytes consumed while sniffing are replayed after CONNECT.
+    async fn proxy_flow<R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        mut tcp: R,
         shared: &Arc<SharedState>,
         proc_name: Option<&str>,
-        dst: SocketAddr,
         proxy_port: u16,
+        target: &str,
+        buffered: Vec<u8>,
     ) -> Result<(), String> {
-        let (target, buffered) = sniff_target(&mut tcp, dst).await?;
-
         let mut proxy_conn = TcpStream::connect(("127.0.0.1", proxy_port))
             .await
             .map_err(|e| format!("connect proxy: {e}"))?;
@@ -595,13 +689,21 @@ mod engine {
 
     // ------------------------------------------------------------ sniffing
 
+    /// What the sniffer learned about a flow.
+    pub(crate) struct Sniffed {
+        /// CONNECT target (`host:port`) for HTTP/TLS flows; `None` when the
+        /// protocol is neither (relay raw).
+        pub(crate) target: Option<String>,
+        /// Bytes consumed from the stream while sniffing; MUST be replayed
+        /// into whatever path the flow takes.
+        pub(crate) buffered: Vec<u8>,
+    }
+
     /// Read just enough of the stream to learn where it wants to go.
-    /// Returns the CONNECT target (`host:port`) plus any bytes already
-    /// consumed (they must be replayed into the tunnel).
-    async fn sniff_target(
-        tcp: &mut ipstack::IpStackTcpStream,
+    pub(crate) async fn sniff_target<R: tokio::io::AsyncRead + Unpin>(
+        tcp: &mut R,
         dst: SocketAddr,
-    ) -> Result<(String, Vec<u8>), String> {
+    ) -> Result<Sniffed, String> {
         use tokio::io::AsyncReadExt;
         let mut buf: Vec<u8> = Vec::with_capacity(512);
         let mut chunk = [0u8; 512];
@@ -636,46 +738,59 @@ mod engine {
             let host = sni_from_client_hello(&buf)
                 .unwrap_or_else(|| dst.ip().to_string());
             let target = format!("{}:{}", host.trim_end_matches('.'), dst.port());
-            return Ok((target, buf));
+            return Ok(Sniffed {
+                target: Some(target),
+                buffered: buf,
+            });
         }
 
         // Plain HTTP: read until end of request head, then use the Host
-        // header. Anything else is a non-HTTP protocol -> relay directly.
+        // header. Anything else is a non-HTTP protocol -> relay raw (target
+        // None, bytes replayed by the caller).
         loop {
-            if let Some(pos) = find(bufwindows(&buf), b"\r\n\r\n") {
+            if let Some(pos) = find(&buf, b"\r\n\r\n") {
                 let head = &buf[..pos];
-                if let Some(host) = host_from_http_head(head) {
-                    let (h, p) = split_host_port(&host, dst.port());
-                    return Ok((format!("{h}:{p}"), buf));
-                }
-                // HTTP-ish but no Host header: fall back to the literal
-                // destination address.
-                let target = format!("{}:{}", dst.ip(), dst.port());
-                return Ok((target, buf));
+                let target = match host_from_http_head(head) {
+                    Some(host) => {
+                        let (h, p) = split_host_port(&host, dst.port());
+                        format!("{h}:{p}")
+                    }
+                    // HTTP-ish but no Host header: fall back to the literal
+                    // destination address.
+                    None => format!("{}:{}", dst.ip(), dst.port()),
+                };
+                return Ok(Sniffed {
+                    target: Some(target),
+                    buffered: buf,
+                });
             }
             // A first line that doesn't smell like HTTP means "some other
             // protocol" — stop reading, relay raw.
-            if find(bufwindows(&buf), b"\n").is_some() && !looks_like_http_head(&buf) {
-                return Err(NOT_HTTP.into());
+            if find(&buf, b"\n").is_some() && !looks_like_http_head(&buf) {
+                return Ok(Sniffed {
+                    target: None,
+                    buffered: buf,
+                });
             }
             if buf.len() > 64 * 1024 {
-                return Err(NOT_HTTP.into());
+                return Ok(Sniffed {
+                    target: None,
+                    buffered: buf,
+                });
             }
             let n = tokio::time::timeout(Duration::from_secs(10), tcp.read(&mut chunk))
                 .await
-                .map_err(|_| NOT_HTTP.to_string())?
+                .map_err(|_| "timeout reading request head".to_string())?
                 .map_err(|e| e.to_string())?;
             if n == 0 {
-                return Err(NOT_HTTP.into());
+                // Peer hung up mid-head; not enough to classify.
+                return Ok(Sniffed {
+                    target: None,
+                    buffered: buf,
+                });
             }
             buf.extend_from_slice(&chunk[..n]);
         }
-    }
-
-    const NOT_HTTP: &str = "\x00not-http";
-
-    fn bufwindows(b: &[u8]) -> &[u8] {
-        b
     }
 
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -987,13 +1102,61 @@ mod tests {
 
     #[test]
     fn filter_matching() {
-        assert!(process_matches(&[], "anything.exe"));
+        // Empty list hijacks nothing.
+        assert!(!process_matches(&[], "anything.exe"));
         assert!(process_matches(
             &[("chrome".into())],
             "C:\\apps\\Chrome.exe"
         ));
         assert!(!process_matches(&["chrome".into()], "firefox.exe"));
         assert!(!process_matches(&["  ".into()], "chrome.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sniff_tls_http_and_raw() {
+        use std::net::SocketAddr;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        // TLS ClientHello -> SNI target + buffered replay.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let hello = build_client_hello("example.com");
+        rt.block_on(async move {
+            use tokio::io::AsyncWriteExt;
+            client.write_all(&hello).await.unwrap();
+            drop(client);
+            let s = engine::sniff_target(&mut server, dst).await.unwrap();
+            assert_eq!(s.target.as_deref(), Some("example.com:443"));
+            assert_eq!(s.buffered, hello);
+        });
+
+        // Plain HTTP -> Host header target.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        rt.block_on(async move {
+            use tokio::io::AsyncWriteExt;
+            client
+                .write_all(b"GET /a?b=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await
+                .unwrap();
+            drop(client);
+            let s = engine::sniff_target(&mut server, dst).await.unwrap();
+            assert_eq!(s.target.as_deref(), Some("example.com:443"));
+        });
+
+        // Non-HTTP protocol (SSH banner) -> target None, bytes intact.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        rt.block_on(async move {
+            use tokio::io::AsyncWriteExt;
+            client.write_all(b"SSH-2.0-OpenSSH_9\r\n").await.unwrap();
+            drop(client);
+            let s = engine::sniff_target(&mut server, dst).await.unwrap();
+            assert_eq!(s.target, None);
+            assert_eq!(s.buffered, b"SSH-2.0-OpenSSH_9\r\n");
+        });
     }
 
     #[test]

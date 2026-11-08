@@ -1400,6 +1400,48 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                     });
                 });
         });
+
+    // ---- Recent flows log ----------------------------------------------
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new("Recent flows")
+            .size(12.0)
+            .strong()
+            .color(theme::TEXT),
+    );
+    ui.add_space(2.0);
+    theme::card(ui, |ui| {
+        let events = shared.tun_events.lock().unwrap();
+        if events.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No TUN flows yet. Hijacked processes' HTTP(S) flows show as \"proxy\" \
+                     here and appear in HTTP history.",
+                )
+                .size(11.5)
+                .color(theme::MUTED),
+            );
+        } else {
+            ScrollArea::vertical()
+                .id_salt("tun_flow_log")
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for line in events.iter() {
+                        ui.label(
+                            RichText::new(line)
+                                .monospace()
+                                .size(11.0)
+                                .color(if line.contains("proxy") {
+                                    theme::ACCENT
+                                } else {
+                                    theme::MUTED
+                                }),
+                        );
+                    }
+                });
+        }
+    });
 }
 
 /// Add/remove `name` in the persisted hijack filter. The engine reads the

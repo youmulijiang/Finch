@@ -267,6 +267,9 @@ pub struct SharedState {
     /// The interceptor reads this by the client source port to tag history
     /// entries. Entries expire after ~2 minutes.
     pub tun_proc_map: Mutex<HashMap<u16, (String, std::time::Instant)>>,
+    /// TUN flow decisions for the TUN tab (newest first, capped): one line
+    /// per TCP flow — process, target and the path taken (proxy/direct).
+    pub tun_events: Mutex<std::collections::VecDeque<String>>,
     /// session_id (mitm correlation) -> ids of this connection's requests
     /// awaiting their response, in request order (FIFO). HTTP/1.1 answers
     /// requests in order, so popping the front pairs each response with the
@@ -303,6 +306,7 @@ impl SharedState {
             tun_enabled: AtomicBool::new(false),
             tun_status: Mutex::new(String::new()),
             tun_proc_map: Mutex::new(HashMap::new()),
+            tun_events: Mutex::new(std::collections::VecDeque::new()),
             session_map: Mutex::new(HashMap::new()),
             ws_sessions: Mutex::new(Vec::new()),
             ws_session_map: Mutex::new(HashMap::new()),
