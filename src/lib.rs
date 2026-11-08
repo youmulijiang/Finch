@@ -18,4 +18,5 @@ pub mod mcp_test_server;
 pub mod mitm;
 pub mod proxy_ctrl;
 pub mod state;
+pub mod tun;
 pub mod ui;

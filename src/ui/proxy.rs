@@ -51,6 +51,8 @@ pub struct ProxyUi {
     pub upstream_edit: Option<String>,
     pub intercept_filter_edit: Option<String>,
     pub blacklist_edit: Option<String>,
+    /// TUN process-filter edit buffer (None = not seeded yet).
+    pub tun_filter_edit: Option<String>,
     // --- WebSockets ---
     pub ws: crate::ui::websocket::WsPanelUi,
     /// True while a Notes cell has keyboard focus (set during the previous
@@ -81,6 +83,7 @@ impl Default for ProxyUi {
             upstream_edit: None,
             intercept_filter_edit: None,
             blacklist_edit: None,
+            tun_filter_edit: None,
             ws: crate::ui::websocket::WsPanelUi::default(),
             notes_editing: false,
         }
@@ -491,6 +494,11 @@ impl RowFilter {
                     .unwrap_or(false)
             } else if let Some(rest) = tok.strip_prefix("host:") {
                 e.host.to_lowercase().contains(rest)
+            } else if let Some(rest) = tok.strip_prefix("process:") {
+                e.process
+                    .as_deref()
+                    .map(|p| p.to_lowercase().contains(rest))
+                    .unwrap_or(false)
             } else if let Some(rest) = tok.strip_prefix("mime:") {
                 e.mime.as_deref().map(|m| m.contains(rest)).unwrap_or(false)
             } else {
@@ -542,7 +550,7 @@ fn show_history(
         ui.add(
             egui::TextEdit::singleline(&mut p.filter)
                 .desired_width(420.0)
-                .hint_text("text, status:404, host:example.com, mime:json"),
+                .hint_text("text, status:404, host:example.com, mime:json, process:chrome"),
         );
         if theme::button(ui, !p.filter.is_empty(), "Clear", ButtonKind::Secondary).clicked() {
             p.filter.clear();
@@ -662,6 +670,7 @@ fn show_history(
                     .column(Column::initial(32.0))
                     .column(Column::initial(100.0).resizable(true))
                     .column(Column::initial(54.0))
+                    .column(Column::initial(90.0).resizable(true))
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
                 if (avail - p.history_table_width).abs() > 1.0 {
                     table.reset();
@@ -686,6 +695,7 @@ fn show_history(
                             "TLS",
                             "IP",
                             "Cookies",
+                            "Process",
                         ];
                         for (idx, name) in names.iter().enumerate() {
                             h.col(|ui| {
@@ -854,6 +864,17 @@ fn show_history(
                                 } else {
                                     ui.label(RichText::new("-").size(12.0).color(theme::MUTED));
                                 }
+                            });
+                            row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            entry.process.clone().unwrap_or_default(),
+                                        )
+                                        .size(11.5),
+                                    )
+                                    .truncate(),
+                                );
                             });
                             let row_resp = row.response();
                             if row_resp.clicked() || row_resp.container_secondary_clicked() {
@@ -1057,6 +1078,7 @@ fn sort_entries(entries: &mut [Arc<std::sync::Mutex<HistoryEntry>>], col: usize,
             12 => a.notes.to_lowercase().cmp(&b.notes.to_lowercase()),
             13 => a.tls.cmp(&b.tls),
             14 => a.server_ip.cmp(&b.server_ip),
+            16 => a.process.cmp(&b.process),
             _ => a.cookies.cmp(&b.cookies),
         };
         if asc { ord } else { ord.reverse() }
@@ -1378,6 +1400,124 @@ fn show_options(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                     RichText::new(format!("{count} pattern(s) active"))
                         .size(11.5)
                         .color(theme::MUTED),
+                );
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // --- TUN mode ---------------------------------------------------
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "TUN mode (capture by process)");
+            ui.add_space(6.0);
+            let enabled = shared.tun_enabled.load(std::sync::atomic::Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                if theme::button(
+                    ui,
+                    true,
+                    if enabled { "Disable TUN" } else { "Enable TUN" },
+                    if enabled {
+                        ButtonKind::Danger
+                    } else {
+                        ButtonKind::Primary
+                    },
+                )
+                .clicked()
+                {
+                    if enabled {
+                        crate::tun::stop(shared.clone());
+                        shared.set_status("TUN mode disabled");
+                    } else {
+                        match crate::tun::start(shared.clone()) {
+                            Ok(()) => shared.set_status("TUN mode enabled"),
+                            Err(e) => {
+                                *shared.tun_status.lock().unwrap() = e.clone();
+                                shared.set_status(format!("TUN failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                theme::status_dot(
+                    ui,
+                    if enabled {
+                        theme::SUCCESS
+                    } else {
+                        theme::MUTED
+                    },
+                );
+                let status = shared.tun_status.lock().unwrap().clone();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(if status.is_empty() {
+                            if enabled { "starting...".to_string() } else { "off".to_string() }
+                        } else {
+                            status
+                        })
+                        .size(11.5)
+                        .monospace()
+                        .color(if enabled { theme::SUCCESS } else { theme::MUTED }),
+                    )
+                    .truncate(),
+                );
+            });
+            ui.add_space(4.0);
+            theme::hint(
+                ui,
+                "Routes IPv4 through a virtual adapter (FinchTun, 10.10.0.2). Flows of matching \
+                 processes are sent through Finch's proxy and appear in HTTP history with their \
+                 process name; everything else (incl. all UDP/DNS) is relayed directly. Requires \
+                 running Finch as administrator; wintun.dll is downloaded on first enable. IPv4 \
+                 only — IPv6 stays on the physical interface. Turn TUN off before closing Finch.",
+            );
+            ui.add_space(6.0);
+
+            // Process filter: one name fragment per line, live-applied.
+            if p.tun_filter_edit.is_none() {
+                p.tun_filter_edit = Some(
+                    shared
+                        .settings
+                        .lock()
+                        .unwrap()
+                        .tun_process_filter
+                        .join("\n"),
+                );
+            }
+            ui.label(RichText::new("Process filter").color(theme::TEXT));
+            if let Some(edit) = p.tun_filter_edit.as_mut() {
+                ui.add(
+                    egui::TextEdit::multiline(edit)
+                        .id_salt("tun_process_filter_edit")
+                        .desired_width(ui.available_width().min(560.0))
+                        .desired_rows(2)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("chrome\nfirefox\ncurl  —  one fragment per line; empty = capture all processes"),
+                );
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, true, "Apply process filter", ButtonKind::Secondary).clicked()
+                {
+                    let list: Vec<String> = p
+                        .tun_filter_edit
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    shared.settings.lock().unwrap().tun_process_filter = list;
+                    crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
+                    shared.set_status("TUN process filter applied (live)");
+                }
+                let n = shared.settings.lock().unwrap().tun_process_filter.len();
+                ui.label(
+                    RichText::new(if n == 0 {
+                        "capturing all processes".to_string()
+                    } else {
+                        format!("{n} process filter(s) active")
+                    })
+                    .size(11.5)
+                    .color(theme::MUTED),
                 );
             });
         });

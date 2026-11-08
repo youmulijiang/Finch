@@ -113,6 +113,19 @@ fn prime_dns(
     });
 }
 
+/// TUN mode attribution: the TUN shim records the local port of its proxy
+/// connection together with the owning process; the client source port the
+/// proxy observes is exactly that port.
+fn tun_process_for(
+    shared: &Arc<SharedState>,
+    source: Option<std::net::SocketAddr>,
+) -> Option<String> {
+    let port = source?.port();
+    let mut map = shared.tun_proc_map.lock().unwrap();
+    map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(120));
+    map.get(&port).map(|(name, _)| name.clone())
+}
+
 #[async_trait::async_trait]
 impl Interceptor for FinchInterceptor {
     async fn intercept_request(
@@ -209,6 +222,7 @@ impl Interceptor for FinchInterceptor {
             server_ip: http_msg::ip_literal(&host),
             cookies: http_msg::cookie_count(&raw),
             notes: String::new(),
+            process: tun_process_for(shared, request.source()),
             req_raw: raw.clone(),
             resp_raw: None,
             state: if intercepting {
@@ -564,6 +578,7 @@ impl Interceptor for FinchInterceptor {
                     server_ip: http_msg::ip_literal(&response.source().to_string()),
                     cookies: 0,
                     notes: String::new(),
+                    process: None,
                     req_raw: Vec::new(),
                     resp_raw: Some(raw),
                     state: EntryState::Complete,

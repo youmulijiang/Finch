@@ -28,6 +28,7 @@ fn sample_entry() -> HistoryEntry {
         server_ip: Some("93.184.216.34".into()),
         cookies: 2,
         notes: "note".into(),
+        process: Some("sample.exe".into()),
         req_raw: b"GET /index.html?foo=1&bar=2 HTTP/1.1\r\nHost: example.com\r\nCookie: a=1; b=2\r\n\r\n"
             .to_vec(),
         resp_raw: Some(

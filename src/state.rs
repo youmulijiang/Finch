@@ -71,6 +71,8 @@ pub struct HistoryEntry {
     pub cookies: usize,
     /// Free-form user note (editable in the history table).
     pub notes: String,
+    /// Owning process name (TUN mode only), e.g. "chrome.exe".
+    pub process: Option<String>,
     /// Raw request bytes as captured (updated when edited via Intercept).
     pub req_raw: Vec<u8>,
     pub resp_raw: Option<Vec<u8>>,
@@ -146,6 +148,11 @@ pub struct ProxySettings {
     /// Configured MCP servers.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// TUN mode process filter: capture only flows whose owning process name
+    /// contains one of these entries (case-insensitive). Empty = capture all
+    /// processes (Finch itself is always excluded from the proxy path).
+    #[serde(default)]
+    pub tun_process_filter: Vec<String>,
 }
 
 /// OpenAI-compatible chat endpoint settings.
@@ -232,6 +239,7 @@ impl Default for ProxySettings {
             host_blacklist: Vec::new(),
             ai: AiSettings::default(),
             mcp_servers: Vec::new(),
+            tun_process_filter: Vec::new(),
         }
     }
 }
@@ -250,6 +258,15 @@ pub struct SharedState {
     pub intercept_ws: AtomicBool,
     /// Optional substring filter; empty = intercept everything.
     pub intercept_filter: Mutex<String>,
+    /// TUN mode runtime state (UI toggle + status line).
+    pub tun_enabled: AtomicBool,
+    /// Last TUN event/error for the Options card, e.g. adapter info.
+    pub tun_status: Mutex<String>,
+    /// TUN flow attribution: the local port Finch used when dialing the
+    /// proxy on behalf of a TUN flow -> owning process name + insert time.
+    /// The interceptor reads this by the client source port to tag history
+    /// entries. Entries expire after ~2 minutes.
+    pub tun_proc_map: Mutex<HashMap<u16, (String, std::time::Instant)>>,
     /// session_id (mitm correlation) -> ids of this connection's requests
     /// awaiting their response, in request order (FIFO). HTTP/1.1 answers
     /// requests in order, so popping the front pairs each response with the
@@ -283,6 +300,9 @@ impl SharedState {
             intercept_resp: AtomicBool::new(false),
             intercept_ws: AtomicBool::new(false),
             intercept_filter: Mutex::new(String::new()),
+            tun_enabled: AtomicBool::new(false),
+            tun_status: Mutex::new(String::new()),
+            tun_proc_map: Mutex::new(HashMap::new()),
             session_map: Mutex::new(HashMap::new()),
             ws_sessions: Mutex::new(Vec::new()),
             ws_session_map: Mutex::new(HashMap::new()),

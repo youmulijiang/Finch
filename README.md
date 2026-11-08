@@ -27,6 +27,12 @@ small size: `opt-level = "z"`, fat LTO, one codegen unit, stripped symbols, abor
 - **Proxy ▸ Options** — intercept toggles + URL substring filter, listener status,
   upstream proxy (HTTP / SOCKS5 / SOCKS5h), **host blacklist** (regex), CA export,
   launch browser via proxy, history limit.
+- **TUN mode (Windows)** — one-click virtual-adapter capture: routes IPv4 through a
+  wintun adapter, attributes every flow to the **owning process**, and pushes flows of
+  matching processes (live process-name filter) through the proxy for full
+  interception/history with a `Process` column; everything else (incl. UDP/DNS) is
+  relayed directly via the physical interface. Requires administrator; `wintun.dll` is
+  downloaded automatically on first enable.
 - **Target ▸ Site map** — host → path tree built from captured traffic, scope host list
   with "only in-scope" filtering, per-entry viewer.
 - **Repeater** — edit and resend raw requests through the **hyper** engine (http/https),
