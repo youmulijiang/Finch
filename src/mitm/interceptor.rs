@@ -1,0 +1,515 @@
+//! Traffic interception and modification interfaces
+
+use crate::mitm::error::Result;
+use bytes::Bytes;
+use slinger::{Body, Request, Response};
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::timeout;
+use uuid::Uuid;
+
+/// Generate a new unique session ID using UUID v4
+fn generate_session_id() -> u128 {
+    Uuid::new_v4().as_u128()
+}
+
+/// MITM Request wrapper that wraps slinger::Request with connection metadata.
+/// Used for both HTTP and non-HTTP (raw TCP) traffic interception.
+#[derive(Clone)]
+pub struct MitmRequest {
+    /// Unique session ID to correlate this request with its response (UUID v4 as u128)
+    session_id: u128,
+    /// Source address and port (client)
+    pub source: Option<SocketAddr>,
+    /// Destination address (host:port)
+    pub destination: String,
+    /// Timestamp when the request was intercepted
+    pub timestamp: u64,
+    /// Whether this is an HTTP request (true) or raw TCP (false)
+    is_http: bool,
+    /// The underlying request (contains body for both HTTP and raw TCP)
+    pub request: Request,
+}
+
+impl MitmRequest {
+    /// Create a new MITM request wrapper for HTTP traffic
+    pub fn new(destination: impl Into<String>, request: Request) -> Self {
+        Self {
+            session_id: generate_session_id(),
+            source: None,
+            destination: destination.into(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: true,
+            request,
+        }
+    }
+
+    /// Create a new MITM request with source address for HTTP traffic
+    pub fn with_source(
+        source: SocketAddr,
+        destination: impl Into<String>,
+        request: Request,
+    ) -> Self {
+        Self {
+            session_id: generate_session_id(),
+            source: Some(source),
+            destination: destination.into(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: true,
+            request,
+        }
+    }
+
+    /// Create a MITM request for raw TCP data (non-HTTP)
+    pub fn raw_tcp(destination: impl Into<String>, body: impl Into<Bytes>) -> Self {
+        let request = Request {
+            body: Some(Body::from(body.into())),
+            ..Default::default()
+        };
+        Self {
+            session_id: generate_session_id(),
+            source: None,
+            destination: destination.into(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: false,
+            request,
+        }
+    }
+
+    /// Create a MITM request for raw TCP data with source address
+    pub fn raw_tcp_with_source(
+        source: SocketAddr,
+        destination: impl Into<String>,
+        body: impl Into<Bytes>,
+    ) -> Self {
+        let request = Request {
+            body: Some(Body::from(body.into())),
+            ..Default::default()
+        };
+        Self {
+            session_id: generate_session_id(),
+            source: Some(source),
+            destination: destination.into(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: false,
+            request,
+        }
+    }
+
+    /// Get the session ID (used to correlate request with response)
+    pub fn session_id(&self) -> u128 {
+        self.session_id
+    }
+
+    /// Set the session ID (used to override auto-generated session_id for TCP connections)
+    pub fn set_session_id(&mut self, session_id: u128) {
+        self.session_id = session_id;
+    }
+
+    /// Get the source address
+    pub fn source(&self) -> Option<SocketAddr> {
+        self.source
+    }
+
+    /// Get the destination address
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    /// Get the timestamp
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Get the underlying request
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
+    /// Get a mutable reference to the underlying request
+    pub fn request_mut(&mut self) -> &mut Request {
+        &mut self.request
+    }
+
+    /// Get the body as bytes (for raw TCP traffic)
+    pub fn body(&self) -> Option<&Body> {
+        self.request.body.as_ref()
+    }
+
+    /// Set the body (for raw TCP traffic)
+    pub fn set_body(&mut self, body: impl Into<Bytes>) {
+        self.request.body = Some(Body::from(body.into()));
+    }
+
+    /// Check if this is an HTTP request (true) or raw TCP (false)
+    pub fn is_http(&self) -> bool {
+        self.is_http
+    }
+}
+
+impl fmt::Debug for MitmRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MitmRequest")
+            .field("session_id", &self.session_id)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("timestamp", &self.timestamp)
+            .field("is_http", &self.is_http())
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+/// MITM Response wrapper that wraps slinger::Response with connection metadata.
+/// Used for both HTTP and non-HTTP (raw TCP) traffic interception.
+#[derive(Clone)]
+pub struct MitmResponse {
+    /// Unique session ID to correlate this response with its request (UUID v4 as u128)
+    session_id: u128,
+    /// Source address (where the response came from, host:port)
+    pub source: String,
+    /// Destination address and port (client)
+    pub destination: Option<SocketAddr>,
+    /// Timestamp when the response was intercepted
+    pub timestamp: u64,
+    /// Whether this is an HTTP response (true) or raw TCP (false)
+    is_http: bool,
+    /// The underlying response (contains body for both HTTP and raw TCP)
+    pub response: Response,
+}
+
+impl MitmResponse {
+    /// Create a new MITM response wrapper for HTTP traffic
+    /// The session_id should match the corresponding MitmRequest's session_id
+    pub fn new(session_id: u128, source: impl Into<String>, response: Response) -> Self {
+        Self {
+            session_id,
+            source: source.into(),
+            destination: None,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: true,
+            response,
+        }
+    }
+
+    /// Create a new MITM response with destination address for HTTP traffic
+    /// The session_id should match the corresponding MitmRequest's session_id
+    pub fn with_destination(
+        session_id: u128,
+        source: impl Into<String>,
+        destination: SocketAddr,
+        response: Response,
+    ) -> Self {
+        Self {
+            session_id,
+            source: source.into(),
+            destination: Some(destination),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: true,
+            response,
+        }
+    }
+
+    /// Create a MITM response for raw TCP data (non-HTTP)
+    /// The session_id should match the corresponding MitmRequest's session_id
+    pub fn raw_tcp(session_id: u128, source: impl Into<String>, body: impl Into<Bytes>) -> Self {
+        let response = Response {
+            body: Some(Body::from(body.into())),
+            ..Default::default()
+        };
+        Self {
+            session_id,
+            source: source.into(),
+            destination: None,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: false,
+            response,
+        }
+    }
+
+    /// Create a MITM response for raw TCP data with destination address
+    /// The session_id should match the corresponding MitmRequest's session_id
+    pub fn raw_tcp_with_destination(
+        session_id: u128,
+        source: impl Into<String>,
+        destination: SocketAddr,
+        body: impl Into<Bytes>,
+    ) -> Self {
+        let response = Response {
+            body: Some(Body::from(body.into())),
+            ..Default::default()
+        };
+        Self {
+            session_id,
+            source: source.into(),
+            destination: Some(destination),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            is_http: false,
+            response,
+        }
+    }
+
+    /// Get the session ID (used to correlate response with request)
+    pub fn session_id(&self) -> u128 {
+        self.session_id
+    }
+
+    /// Get the source address
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Get the destination address
+    pub fn destination(&self) -> Option<SocketAddr> {
+        self.destination
+    }
+
+    /// Get the timestamp
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Get the underlying response
+    pub fn response(&self) -> &Response {
+        &self.response
+    }
+
+    /// Get a mutable reference to the underlying response
+    pub fn response_mut(&mut self) -> &mut Response {
+        &mut self.response
+    }
+
+    /// Get the body as bytes (for raw TCP traffic)
+    pub fn body(&self) -> Option<&Body> {
+        self.response.body.as_ref()
+    }
+
+    /// Set the body (for raw TCP traffic)
+    pub fn set_body(&mut self, body: impl Into<Bytes>) {
+        self.response.body = Some(Body::from(body.into()));
+    }
+
+    /// Check if this is an HTTP response (true) or raw TCP (false)
+    pub fn is_http(&self) -> bool {
+        self.is_http
+    }
+}
+
+impl fmt::Debug for MitmResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MitmResponse")
+            .field("session_id", &self.session_id)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("timestamp", &self.timestamp)
+            .field("is_http", &self.is_http())
+            .field("response", &self.response)
+            .finish()
+    }
+}
+
+/// Direction of a WebSocket message relative to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDirection {
+    /// Client -> origin server.
+    Outgoing,
+    /// Origin server -> client.
+    Incoming,
+}
+
+/// A decoded WebSocket message observed on an upgraded connection.
+/// Read-only capture: interceptors may inspect but not modify the stream.
+#[derive(Debug, Clone)]
+pub struct WsMessage {
+    /// Session id of the originating handshake (matches MitmRequest).
+    pub session_id: u128,
+    /// Origin destination (host:port).
+    pub destination: String,
+    pub direction: WsDirection,
+    pub opcode: crate::mitm::websocket::WsOpcode,
+    /// Unmasked payload bytes (final message after fragmentation reassembly).
+    pub payload: Vec<u8>,
+    /// Epoch milliseconds when the last fragment was observed.
+    pub timestamp: u64,
+}
+
+/// Unified trait for intercepting both requests and responses with automatic correlation
+/// This trait is recommended over separate RequestInterceptor and ResponseInterceptor
+/// as it provides automatic session correlation between requests and responses.
+#[async_trait::async_trait]
+pub trait Interceptor: Send + Sync {
+    /// Intercept and optionally modify a request
+    ///
+    /// Return `None` to block the request, or return a modified request
+    async fn intercept_request(&self, request: MitmRequest) -> Result<Option<MitmRequest>> {
+        // Default implementation passes through
+        Ok(Some(request))
+    }
+
+    /// Intercept and optionally modify a response
+    /// The response is automatically correlated with its request via session_id
+    ///
+    /// Return `None` to block the response, or return a modified response
+    async fn intercept_response(&self, response: MitmResponse) -> Result<Option<MitmResponse>> {
+        // Default implementation passes through
+        Ok(Some(response))
+    }
+
+    /// Inspect a decoded WebSocket message on an upgraded connection.
+    /// Return `Some(message)` to forward (possibly with a modified payload),
+    /// or `None` to drop the message. Default passes through unmodified.
+    async fn intercept_ws_message(&self, message: WsMessage) -> Result<Option<WsMessage>> {
+        Ok(Some(message))
+    }
+}
+
+/// Combined interceptor handler for both HTTP and TCP traffic
+/// Manages automatic correlation between requests and responses via session IDs
+pub struct InterceptorHandler {
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    /// Per-interceptor timeout in seconds
+    timeout_secs: u64,
+}
+
+impl InterceptorHandler {
+    /// Create a new interceptor handler
+    pub fn new() -> Self {
+        Self {
+            interceptors: Vec::new(),
+            timeout_secs: 60,
+        }
+    }
+
+    /// Create a new interceptor handler with a configurable per-interceptor timeout
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Add a unified interceptor that handles both requests and responses
+    /// This is the recommended way to add interceptors as it provides automatic
+    /// session correlation between requests and responses
+    pub fn add_interceptor(&mut self, interceptor: Arc<dyn Interceptor>) {
+        self.interceptors.push(interceptor);
+    }
+
+    /// Process a request through all interceptors
+    pub async fn process_request(&self, mut request: MitmRequest) -> Result<Option<MitmRequest>> {
+        // Process through unified interceptors first
+        for interceptor in &self.interceptors {
+            // Clone the request so a timed-out interceptor doesn't consume ownership
+            // of the in-band request. Dashed interceptor results will replace `request`.
+            let request_clone = request.clone();
+            match timeout(
+                std::time::Duration::from_secs(self.timeout_secs),
+                interceptor.intercept_request(request_clone),
+            )
+            .await
+            {
+                // Interceptor completed within timeout
+                Ok(Ok(Some(modified))) => request = modified,
+                Ok(Ok(None)) => return Ok(None), // Request blocked by interceptor
+                Ok(Err(e)) => return Err(e),     // Interceptor returned an error
+                // Timeout -> skip this interceptor but continue processing
+                Err(_) => {
+                    tracing::warn!(
+                        "Interceptor timed out after {}s; skipping",
+                        self.timeout_secs
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(Some(request))
+    }
+
+    /// Process a response through all interceptors
+    pub async fn process_response(
+        &self,
+        mut response: MitmResponse,
+    ) -> Result<Option<MitmResponse>> {
+        // Process through unified interceptors first
+        for interceptor in &self.interceptors {
+            // Clone before invoking so timeouts don't consume the in-band response
+            let response_clone = response.clone();
+            match timeout(
+                std::time::Duration::from_secs(self.timeout_secs),
+                interceptor.intercept_response(response_clone),
+            )
+            .await
+            {
+                Ok(Ok(Some(modified))) => response = modified,
+                Ok(Ok(None)) => return Ok(None), // Response blocked
+                Ok(Err(e)) => return Err(e),     // Interceptor error
+                Err(_) => {
+                    tracing::warn!(
+                        "Interceptor timed out after {}s; skipping",
+                        self.timeout_secs
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(Some(response))
+    }
+
+    /// Check if any interceptors are registered
+    pub fn has_interceptors(&self) -> bool {
+        !self.interceptors.is_empty()
+    }
+
+    /// Run a decoded WebSocket message through all interceptors. The first
+    /// interceptor that returns `None` drops the message; a modified payload
+    /// replaces the message for subsequent interceptors.
+    pub async fn process_ws_message(&self, mut message: WsMessage) -> Result<Option<WsMessage>> {
+        for interceptor in &self.interceptors {
+            match timeout(
+                std::time::Duration::from_secs(self.timeout_secs),
+                interceptor.intercept_ws_message(message.clone()),
+            )
+            .await
+            {
+                Ok(Ok(Some(m))) => message = m,
+                Ok(Ok(None)) => return Ok(None),
+                Ok(Err(_)) => continue,
+                Err(_) => {
+                    tracing::warn!("WebSocket interceptor timed out; skipping");
+                    continue;
+                }
+            }
+        }
+        Ok(Some(message))
+    }
+}
+
+impl Default for InterceptorHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
