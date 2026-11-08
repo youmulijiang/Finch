@@ -1366,7 +1366,7 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                     });
                     h.col(|ui| {
                         ui.label(
-                            RichText::new("Action")
+                            RichText::new("Hijack")
                                 .size(11.0)
                                 .color(theme::MUTED),
                         );
@@ -1390,16 +1390,11 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                             ui.label(RichText::new(name).size(12.0));
                         });
                         row.col(|ui| {
-                            let label = if hijacked {
-                                RichText::new("Stop hijack").size(11.5).color(theme::DANGER)
-                            } else {
-                                RichText::new("Hijack").size(11.5)
-                            };
-                            if ui
-                                .add_enabled(true, egui::Button::new(label))
-                                .clicked()
-                            {
-                                toggle_hijack(shared, name, hijacked);
+                            // Toggle switch: off by default (traffic is only
+                            // relayed); flipping it hijacks the process.
+                            let mut on = hijacked;
+                            if theme::toggle(ui, &mut on) {
+                                toggle_hijack(shared, name, on);
                             }
                         });
                     });

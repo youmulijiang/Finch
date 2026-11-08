@@ -206,7 +206,6 @@ mod engine {
 
     const TUN_NAME: &str = "FinchTun";
     const TUN_ADDR: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
-    const TUN_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
     const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
     const MTU: u16 = 65535;
     /// Wintun release shipped on first use (official signed build).
@@ -262,16 +261,39 @@ mod engine {
             )
             .map_err(|e| format!("failed to open TUN adapter: {e}"))?;
 
+            // The /1 routes must be scoped to the TUN interface itself: a
+            // gateway-only route cannot be resolved by CreateIpForwardEntry2
+            // (ERROR_FILE_NOT_FOUND) because the gateway is not tied to an
+            // interface index. The freshly assigned adapter address produced
+            // an on-link 10.10.0.0/24 route — look it up and reuse its
+            // interface index (same approach as mihomo's auto-route).
+            let mut probe = RouteManager::new().map_err(|e| format!("route manager: {e}"))?;
+            let tun_if_index = {
+                let mut found = None;
+                for _ in 0..10 {
+                    if let Ok(list) = probe.list() {
+                        if let Some(r) = list.iter().find(|r| {
+                            r.destination() == IpAddr::from([10, 10, 0, 0]) && r.prefix() == 24
+                        }) {
+                            found = r.if_index();
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                found.ok_or_else(|| {
+                    "could not locate the FinchTun interface (no on-link 10.10.0.0/24 route)".to_string()
+                })?
+            };
+
             // Split default route: two /1s beat the default /0 regardless of
             // metric, so we never touch the default route entry itself.
             let routes: Vec<Route> = vec![
-                Route::new(IpAddr::from([0, 0, 0, 0]), 1).with_gateway(IpAddr::from(TUN_GATEWAY.octets())),
-                Route::new(IpAddr::from([128, 0, 0, 0]), 1)
-                    .with_gateway(IpAddr::from(TUN_GATEWAY.octets())),
+                Route::new(IpAddr::from([0, 0, 0, 0]), 1).with_if_index(tun_if_index),
+                Route::new(IpAddr::from([128, 0, 0, 0]), 1).with_if_index(tun_if_index),
             ];
-            let mut manager = RouteManager::new().map_err(|e| format!("route manager: {e}"))?;
             for r in &routes {
-                manager.add(r).map_err(|e| {
+                probe.add(r).map_err(|e| {
                     format!("failed to add TUN route {r}: {e} (administrator required)")
                 })?;
             }
