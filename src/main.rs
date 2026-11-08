@@ -37,6 +37,39 @@ fn main() -> eframe::Result {
     // 3. Start the MITM proxy.
     proxy_ctrl::restart_proxy(&rt, shared.clone());
 
+    // 3b. Elevation relaunch: `--elevated-tun` means this instance was just
+    // restarted via UAC from the TUN tab — wait for the listener (the old
+    // instance may still hold the port for a moment), then auto-enable TUN.
+    if std::env::args().any(|a| a == "--elevated-tun") {
+        let rt2 = rt.clone();
+        let shared2 = shared.clone();
+        rt.spawn(async move {
+            for _ in 0..20 {
+                if shared2
+                    .proxy_listening
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if !shared2
+                .proxy_listening
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                proxy_ctrl::restart_proxy(&rt2, shared2.clone());
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            match finch::tun::start(shared2.clone()) {
+                Ok(()) => shared2.set_status("TUN mode enabled (elevated relaunch)"),
+                Err(e) => {
+                    *shared2.tun_status.lock().unwrap() = e.clone();
+                    shared2.set_status(format!("TUN autostart failed: {e}"));
+                }
+            }
+        });
+    }
+
     // 4. egui app.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -31,8 +31,9 @@ small size: `opt-level = "z"`, fat LTO, one codegen unit, stripped symbols, abor
   wintun adapter, lists every process with active network sockets (PID / name) and lets
   you **hijack per process with one click**; hijacked flows are pushed through the proxy
   for full interception/history with a `Process` column, everything else (incl. UDP/DNS)
-  is relayed directly via the physical interface. Requires administrator; `wintun.dll` is
-  downloaded automatically on first enable.
+  is relayed directly via the physical interface. When Finch runs without admin rights,
+  enabling TUN relaunches it elevated via a UAC prompt (TUN auto-starts after the restart);
+  `wintun.dll` is downloaded automatically on first enable.
 - **Target ▸ Site map** — host → path tree built from captured traffic, scope host list
   with "only in-scope" filtering, per-entry viewer.
 - **Repeater** — edit and resend raw requests through the **hyper** engine (http/https),

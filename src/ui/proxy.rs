@@ -1201,21 +1201,39 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                 ButtonKind::Primary
             },
         )
-        .clicked()
-        {
-            if enabled {
-                crate::tun::stop(shared.clone());
-                shared.set_status("TUN mode disabled");
-            } else {
-                match crate::tun::start(shared.clone()) {
-                    Ok(()) => shared.set_status("TUN mode enabled"),
-                    Err(e) => {
-                        *shared.tun_status.lock().unwrap() = e.clone();
-                        shared.set_status(format!("TUN failed: {e}"));
+                .clicked()
+                {
+                    if enabled {
+                        crate::tun::stop(shared.clone());
+                        shared.set_status("TUN mode disabled");
+                    } else if !crate::tun::is_elevated() {
+                        // On-demand elevation: relaunch Finch as administrator
+                        // (UAC); the new instance auto-starts TUN via the
+                        // --elevated-tun flag. History is in-memory only, so
+                        // it resets on the restart.
+                        shared.set_status(
+                            "TUN needs administrator rights — confirming UAC to restart Finch elevated...",
+                        );
+                        match crate::tun::relaunch_elevated("--elevated-tun") {
+                            Ok(()) => {
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            Err(e) => {
+                                *shared.tun_status.lock().unwrap() = e.clone();
+                                shared.set_status(format!("TUN: {e}"));
+                            }
+                        }
+                    } else {
+                        match crate::tun::start(shared.clone()) {
+                            Ok(()) => shared.set_status("TUN mode enabled"),
+                            Err(e) => {
+                                *shared.tun_status.lock().unwrap() = e.clone();
+                                shared.set_status(format!("TUN failed: {e}"));
+                            }
+                        }
                     }
                 }
-            }
-        }
         theme::status_dot(
             ui,
             if enabled {
@@ -1248,8 +1266,9 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
         ui,
         "Routes IPv4 through a virtual adapter (FinchTun, 10.10.0.2). Flows of hijacked \
          processes are sent through Finch's proxy and appear in HTTP history with their \
-         process name; everything else (incl. all UDP/DNS) is relayed directly. Requires \
-         running Finch as administrator; wintun.dll is downloaded on first enable. IPv4 only — \
+         process name; everything else (incl. all UDP/DNS) is relayed directly. Enabling TUN \
+         needs administrator rights: if Finch runs normally, it relaunches elevated via UAC \
+         (in-memory history resets). wintun.dll is downloaded on first enable. IPv4 only — \
          IPv6 stays on the physical interface. Turn TUN off before closing Finch.",
     );
     ui.add_space(8.0);

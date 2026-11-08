@@ -93,6 +93,61 @@ pub fn list_network_processes() -> Vec<(u32, String)> {
     }
 }
 
+/// Whether the current process runs with administrator rights.
+pub fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        engine::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix needs root (or CAP_NET_ADMIN) for TUN; the kernel enforces
+        // it and the error surfaces from the device open anyway.
+        false
+    }
+}
+
+/// Relaunch Finch elevated (UAC) with `extra_arg` appended to the command
+/// line. The current instance should exit right after on success so the new
+/// one can take over the listener port.
+pub fn relaunch_elevated(extra_arg: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("cannot resolve finch.exe: {e}"))?;
+        let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+        let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+        let params: Vec<u16> = format!("{extra_arg}\0").encode_utf16().collect();
+        let ret = unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                params.as_ptr(),
+                std::ptr::null(),
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW returns a value > 32 on success.
+        if ret as isize > 32 {
+            Ok(())
+        } else if ret as isize == 0 {
+            Err("UAC prompt was cancelled — TUN not enabled".into())
+        } else {
+            Err(format!(
+                "elevation failed (ShellExecuteW error {}); start Finch as administrator instead",
+                ret as isize
+            ))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = extra_arg;
+        Err("elevation relaunch is only implemented on Windows".into())
+    }
+}
+
 // ---------------------------------------------------------------- API
 
 /// Enable TUN capture. Requires administrator on Windows.
@@ -801,7 +856,7 @@ mod engine {
 
     // ------------------------------------------------------------- helpers
 
-    fn is_elevated() -> bool {
+    pub(crate) fn is_elevated() -> bool {
         // shell32 IsUserAnAdmin: simple and reliable for our purpose.
         #[link(name = "shell32")]
         unsafe extern "system" {
