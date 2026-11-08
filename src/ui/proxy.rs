@@ -15,6 +15,7 @@ pub enum SubTab {
     Intercept,
     History,
     WebSockets,
+    Tun,
     Options,
 }
 
@@ -51,8 +52,14 @@ pub struct ProxyUi {
     pub upstream_edit: Option<String>,
     pub intercept_filter_edit: Option<String>,
     pub blacklist_edit: Option<String>,
-    /// TUN process-filter edit buffer (None = not seeded yet).
-    pub tun_filter_edit: Option<String>,
+    // --- TUN ---
+    /// Process list for the TUN tab: (pid, process name), refreshed while
+    /// the tab is visible.
+    pub tun_rows: Vec<(u32, String)>,
+    /// Last refresh time of `tun_rows` (throttled to ~1.5 s).
+    pub tun_rows_at: Option<std::time::Instant>,
+    /// Client-side name filter for the TUN process list.
+    pub tun_list_filter: String,
     // --- WebSockets ---
     pub ws: crate::ui::websocket::WsPanelUi,
     /// True while a Notes cell has keyboard focus (set during the previous
@@ -83,7 +90,9 @@ impl Default for ProxyUi {
             upstream_edit: None,
             intercept_filter_edit: None,
             blacklist_edit: None,
-            tun_filter_edit: None,
+            tun_rows: Vec::new(),
+            tun_rows_at: None,
+            tun_list_filter: String::new(),
             ws: crate::ui::websocket::WsPanelUi::default(),
             notes_editing: false,
         }
@@ -100,6 +109,7 @@ pub fn show(
         SubTab::Intercept => show_intercept(ui, shared, p, actions),
         SubTab::History => show_history(ui, shared, p, actions),
         SubTab::WebSockets => crate::ui::websocket::show(ui, shared, &mut p.ws, actions),
+        SubTab::Tun => show_tun(ui, shared, p),
         SubTab::Options => show_options(ui, shared, p),
     }
 }
@@ -1172,6 +1182,244 @@ pub fn format_bytes(len: usize) -> String {
 
 // ---------------------------------------------------------------- Options
 
+// ---------------------------------------------------------------- Tun tab
+
+/// TUN sub-tab: adapter on/off plus a live process list (PID, name, action)
+/// where each row can be toggled for hijacking through the proxy.
+fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
+    let enabled = shared.tun_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+    // ---- Control bar -------------------------------------------------
+    ui.horizontal(|ui| {
+        if theme::button(
+            ui,
+            true,
+            if enabled { "Disable TUN" } else { "Enable TUN" },
+            if enabled {
+                ButtonKind::Danger
+            } else {
+                ButtonKind::Primary
+            },
+        )
+        .clicked()
+        {
+            if enabled {
+                crate::tun::stop(shared.clone());
+                shared.set_status("TUN mode disabled");
+            } else {
+                match crate::tun::start(shared.clone()) {
+                    Ok(()) => shared.set_status("TUN mode enabled"),
+                    Err(e) => {
+                        *shared.tun_status.lock().unwrap() = e.clone();
+                        shared.set_status(format!("TUN failed: {e}"));
+                    }
+                }
+            }
+        }
+        theme::status_dot(
+            ui,
+            if enabled {
+                theme::SUCCESS
+            } else {
+                theme::MUTED
+            },
+        );
+        let status = shared.tun_status.lock().unwrap().clone();
+        ui.add(
+            egui::Label::new(
+                RichText::new(if status.is_empty() {
+                    if enabled {
+                        "starting...".to_string()
+                    } else {
+                        "off".to_string()
+                    }
+                } else {
+                    status
+                })
+                .size(11.5)
+                .monospace()
+                .color(if enabled { theme::SUCCESS } else { theme::MUTED }),
+            )
+            .truncate(),
+        );
+    });
+    ui.add_space(2.0);
+    theme::hint(
+        ui,
+        "Routes IPv4 through a virtual adapter (FinchTun, 10.10.0.2). Flows of hijacked \
+         processes are sent through Finch's proxy and appear in HTTP history with their \
+         process name; everything else (incl. all UDP/DNS) is relayed directly. Requires \
+         running Finch as administrator; wintun.dll is downloaded on first enable. IPv4 only — \
+         IPv6 stays on the physical interface. Turn TUN off before closing Finch.",
+    );
+    ui.add_space(8.0);
+
+    // ---- Hijack list summary ------------------------------------------
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Processes").size(12.0).strong());
+        let filter_len = shared.settings.lock().unwrap().tun_process_filter.len();
+        ui.label(
+            RichText::new(if filter_len == 0 {
+                "no process hijacked — traffic is only relayed".to_string()
+            } else {
+                format!("{filter_len} hijacked (by name)")
+            })
+            .size(11.5)
+            .color(if filter_len > 0 {
+                theme::ACCENT
+            } else {
+                theme::MUTED
+            }),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::button(ui, filter_len > 0, "Clear hijack list", ButtonKind::Secondary)
+                .clicked()
+            {
+                shared.settings.lock().unwrap().tun_process_filter.clear();
+                crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
+                shared.set_status("TUN hijack list cleared");
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Filter").size(12.0).color(theme::MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut p.tun_list_filter)
+                    .desired_width(180.0)
+                    .hint_text("name contains..."),
+            );
+        });
+    });
+    ui.add_space(4.0);
+
+    // ---- Process list --------------------------------------------------
+    // Refresh the enumeration at most every 1.5 s while the tab is open.
+    let stale = p
+        .tun_rows_at
+        .map(|t| t.elapsed() >= std::time::Duration::from_millis(1500))
+        .unwrap_or(true);
+    if stale {
+        p.tun_rows = crate::tun::list_network_processes();
+        p.tun_rows_at = Some(std::time::Instant::now());
+    }
+    let needle = p.tun_list_filter.to_lowercase();
+    let shown: Vec<(u32, String)> = p
+        .tun_rows
+        .iter()
+        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+
+    let table_h = ui.available_height().max(160.0);
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, theme::STROKE))
+        .corner_radius(4.0)
+        .inner_margin(6.0)
+        .show(ui, |ui| {
+            ui.set_height(table_h.min(560.0));
+            if shown.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(
+                        RichText::new(if p.tun_rows.is_empty() {
+                            "No processes with network sockets found."
+                        } else {
+                            "No process matches the filter."
+                        })
+                        .size(12.0)
+                        .color(theme::MUTED),
+                    );
+                });
+                return;
+            }
+            let table = egui_extras::TableBuilder::new(ui)
+                .id_salt("tun_process_table")
+                .striped(true)
+                .vscroll(true)
+                .column(Column::initial(80.0).resizable(true)) // PID
+                .column(Column::remainder().at_least(160.0).resizable(true)) // Name
+                .column(Column::initial(120.0)); // Action
+            table
+                .header(20.0, |mut h| {
+                    h.col(|ui| {
+                        ui.label(RichText::new("PID").size(11.0).color(theme::MUTED));
+                    });
+                    h.col(|ui| {
+                        ui.label(RichText::new("Process").size(11.0).color(theme::MUTED));
+                    });
+                    h.col(|ui| {
+                        ui.label(
+                            RichText::new("Action")
+                                .size(11.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                })
+                .body(|body| {
+                    body.rows(20.0, shown.len(), |mut row| {
+                        let (pid, name) = &shown[row.index()];
+                        let filter = shared.settings.lock().unwrap().tun_process_filter.clone();
+                        let hijacked = crate::tun::process_matches(&filter, name);
+
+                        row.col(|ui| {
+                            ui.label(
+                                RichText::new(pid.to_string())
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(theme::MUTED),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(name).size(12.0));
+                        });
+                        row.col(|ui| {
+                            let label = if hijacked {
+                                RichText::new("Stop hijack").size(11.5).color(theme::DANGER)
+                            } else {
+                                RichText::new("Hijack").size(11.5)
+                            };
+                            if ui
+                                .add_enabled(true, egui::Button::new(label))
+                                .clicked()
+                            {
+                                toggle_hijack(shared, name, hijacked);
+                            }
+                        });
+                    });
+                });
+        });
+}
+
+/// Add/remove `name` in the persisted hijack filter. The engine reads the
+/// list per flow, so changes apply immediately (also for future TUN runs —
+/// the list survives restarts).
+fn toggle_hijack(shared: &Arc<SharedState>, name: &str, currently_hijacked: bool) {
+    let mut settings = shared.settings.lock().unwrap();
+    if currently_hijacked {
+        // Drop every fragment that matches this process name.
+        let lower = name.to_lowercase();
+        settings
+            .tun_process_filter
+            .retain(|f| !lower.contains(&f.trim().to_lowercase()));
+    } else if !settings.tun_process_filter.iter().any(|f| {
+        let f = f.trim().to_lowercase();
+        !f.is_empty() && name.to_lowercase().contains(&f)
+    }) {
+        settings.tun_process_filter.push(name.to_string());
+    }
+    let n = settings.tun_process_filter.len();
+    drop(settings);
+    crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
+    shared.set_status(format!(
+        "{} {} ({} hijacked)",
+        if currently_hijacked {
+            "Stopped hijacking"
+        } else {
+            "Hijacking"
+        },
+        name,
+        n
+    ));
+}
+
 fn show_options(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
     ScrollArea::vertical().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
@@ -1400,124 +1648,6 @@ fn show_options(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                     RichText::new(format!("{count} pattern(s) active"))
                         .size(11.5)
                         .color(theme::MUTED),
-                );
-            });
-        });
-
-        ui.add_space(8.0);
-
-        // --- TUN mode ---------------------------------------------------
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "TUN mode (capture by process)");
-            ui.add_space(6.0);
-            let enabled = shared.tun_enabled.load(std::sync::atomic::Ordering::Relaxed);
-            ui.horizontal(|ui| {
-                if theme::button(
-                    ui,
-                    true,
-                    if enabled { "Disable TUN" } else { "Enable TUN" },
-                    if enabled {
-                        ButtonKind::Danger
-                    } else {
-                        ButtonKind::Primary
-                    },
-                )
-                .clicked()
-                {
-                    if enabled {
-                        crate::tun::stop(shared.clone());
-                        shared.set_status("TUN mode disabled");
-                    } else {
-                        match crate::tun::start(shared.clone()) {
-                            Ok(()) => shared.set_status("TUN mode enabled"),
-                            Err(e) => {
-                                *shared.tun_status.lock().unwrap() = e.clone();
-                                shared.set_status(format!("TUN failed: {e}"));
-                            }
-                        }
-                    }
-                }
-                theme::status_dot(
-                    ui,
-                    if enabled {
-                        theme::SUCCESS
-                    } else {
-                        theme::MUTED
-                    },
-                );
-                let status = shared.tun_status.lock().unwrap().clone();
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(if status.is_empty() {
-                            if enabled { "starting...".to_string() } else { "off".to_string() }
-                        } else {
-                            status
-                        })
-                        .size(11.5)
-                        .monospace()
-                        .color(if enabled { theme::SUCCESS } else { theme::MUTED }),
-                    )
-                    .truncate(),
-                );
-            });
-            ui.add_space(4.0);
-            theme::hint(
-                ui,
-                "Routes IPv4 through a virtual adapter (FinchTun, 10.10.0.2). Flows of matching \
-                 processes are sent through Finch's proxy and appear in HTTP history with their \
-                 process name; everything else (incl. all UDP/DNS) is relayed directly. Requires \
-                 running Finch as administrator; wintun.dll is downloaded on first enable. IPv4 \
-                 only — IPv6 stays on the physical interface. Turn TUN off before closing Finch.",
-            );
-            ui.add_space(6.0);
-
-            // Process filter: one name fragment per line, live-applied.
-            if p.tun_filter_edit.is_none() {
-                p.tun_filter_edit = Some(
-                    shared
-                        .settings
-                        .lock()
-                        .unwrap()
-                        .tun_process_filter
-                        .join("\n"),
-                );
-            }
-            ui.label(RichText::new("Process filter").color(theme::TEXT));
-            if let Some(edit) = p.tun_filter_edit.as_mut() {
-                ui.add(
-                    egui::TextEdit::multiline(edit)
-                        .id_salt("tun_process_filter_edit")
-                        .desired_width(ui.available_width().min(560.0))
-                        .desired_rows(2)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("chrome\nfirefox\ncurl  —  one fragment per line; empty = capture all processes"),
-                );
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if theme::button(ui, true, "Apply process filter", ButtonKind::Secondary).clicked()
-                {
-                    let list: Vec<String> = p
-                        .tun_filter_edit
-                        .as_deref()
-                        .unwrap_or("")
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect();
-                    shared.settings.lock().unwrap().tun_process_filter = list;
-                    crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
-                    shared.set_status("TUN process filter applied (live)");
-                }
-                let n = shared.settings.lock().unwrap().tun_process_filter.len();
-                ui.label(
-                    RichText::new(if n == 0 {
-                        "capturing all processes".to_string()
-                    } else {
-                        format!("{n} process filter(s) active")
-                    })
-                    .size(11.5)
-                    .color(theme::MUTED),
                 );
             });
         });

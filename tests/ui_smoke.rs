@@ -96,6 +96,41 @@ fn history_table_and_split_render_without_panicking() {
     );
 }
 
+#[test]
+fn tun_tab_renders_process_list_without_panicking() {
+    let shared = SharedState::new(Default::default());
+    // Pre-hijack one process name so the table renders the "Stop hijack"
+    // state on the matching row.
+    shared.settings.lock().unwrap().tun_process_filter =
+        vec!["sample.exe".to_string()];
+
+    let mut proxy = ProxyUi {
+        sub_tab: SubTab::Tun,
+        tun_rows: vec![
+            (4242u32, "sample.exe".to_string()),
+            (1234u32, "other.exe".to_string()),
+        ],
+        tun_rows_at: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    let mut actions = Actions::default();
+
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(1200.0, 700.0),
+    ));
+    for _ in 0..2 {
+        let mut frame = ctx.run_ui(raw.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                finch::ui::proxy::show(ui, &shared, &mut proxy, &mut actions);
+            });
+        });
+        frame.textures_delta.clear();
+    }
+}
+
 /// Run `draw` for two frames inside a 1200x700 central panel and collect the
 /// drawn text galley contents.
 fn draw_two_frames(mut draw: impl FnMut(&mut egui::Ui)) -> Vec<String> {

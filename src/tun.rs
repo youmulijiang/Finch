@@ -53,6 +53,46 @@ pub fn is_self_process(proc_name: &str) -> bool {
     self_names.iter().any(|s| !s.is_empty() && s == &n)
 }
 
+/// Running processes that currently own network sockets (TCP/UDP, any
+/// state), deduplicated by PID and sorted by name. Finch itself is excluded
+/// (hijacking it is meaningless and forbidden in the engine). Empty on
+/// non-Windows platforms.
+pub fn list_network_processes() -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    {
+        use std::collections::BTreeSet;
+        let af = netstat2::AddressFamilyFlags::IPV4 | netstat2::AddressFamilyFlags::IPV6;
+        let proto = netstat2::ProtocolFlags::TCP | netstat2::ProtocolFlags::UDP;
+        let Ok(rows) = netstat2::get_sockets_info(af, proto) else {
+            return Vec::new();
+        };
+        let pids: BTreeSet<u32> = rows
+            .iter()
+            .filter_map(|si| si.associated_pids.first().copied())
+            .filter(|pid| *pid > 4) // skip System / Idle
+            .collect();
+        let self_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+        let mut out: Vec<(u32, String)> = pids
+            .into_iter()
+            .filter_map(|pid| {
+                let name = engine::pid_to_name(pid)?;
+                if self_name.as_deref() == Some(&name.to_lowercase()) {
+                    return None;
+                }
+                Some((pid, name))
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 // ---------------------------------------------------------------- API
 
 /// Enable TUN capture. Requires administrator on Windows.
@@ -736,7 +776,7 @@ mod engine {
             })
     }
 
-    fn pid_to_name(pid: u32) -> Option<String> {
+    pub(crate) fn pid_to_name(pid: u32) -> Option<String> {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {

@@ -179,6 +179,7 @@ impl eframe::App for FinchApp {
                             (crate::ui::proxy::SubTab::Intercept, "Intercept"),
                             (crate::ui::proxy::SubTab::History, "HTTP history"),
                             (crate::ui::proxy::SubTab::WebSockets, "WebSockets"),
+                            (crate::ui::proxy::SubTab::Tun, "TUN"),
                             (crate::ui::proxy::SubTab::Options, "Options"),
                         ],
                     );
