@@ -1392,6 +1392,8 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
                         row.col(|ui| {
                             // Toggle switch: off by default (traffic is only
                             // relayed); flipping it hijacks the process.
+                            // NOTE: theme::toggle already flips `on` to the
+                            // NEW state when it returns true.
                             let mut on = hijacked;
                             if theme::toggle(ui, &mut on) {
                                 toggle_hijack(shared, name, on);
@@ -1447,33 +1449,48 @@ fn show_tun(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
 /// Add/remove `name` in the persisted hijack filter. The engine reads the
 /// list per flow, so changes apply immediately (also for future TUN runs —
 /// the list survives restarts).
-fn toggle_hijack(shared: &Arc<SharedState>, name: &str, currently_hijacked: bool) {
-    let mut settings = shared.settings.lock().unwrap();
-    if currently_hijacked {
+/// Apply the toggle's final state for `name`: `now_hijacked == true` puts the
+/// process on the hijack list, false removes it (every fragment that matches
+/// the name). The caller passes the POST-flip state from `theme::toggle`.
+fn toggle_hijack(shared: &Arc<SharedState>, name: &str, now_hijacked: bool) {
+    let n = {
+        let mut settings = shared.settings.lock().unwrap();
+        apply_hijack(&mut settings, name, now_hijacked)
+    };
+    crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
+    shared.set_status(format!(
+        "{} {} ({} hijacked)",
+        if now_hijacked {
+            "Hijacking"
+        } else {
+            "Stopped hijacking"
+        },
+        name,
+        n
+    ));
+}
+
+/// Pure list mutation behind `toggle_hijack`; returns the new list length.
+fn apply_hijack(
+    settings: &mut crate::state::ProxySettings,
+    name: &str,
+    now_hijacked: bool,
+) -> usize {
+    if now_hijacked {
+        if !settings.tun_process_filter.iter().any(|f| {
+            let f = f.trim().to_lowercase();
+            !f.is_empty() && name.to_lowercase().contains(&f)
+        }) {
+            settings.tun_process_filter.push(name.to_string());
+        }
+    } else {
         // Drop every fragment that matches this process name.
         let lower = name.to_lowercase();
         settings
             .tun_process_filter
             .retain(|f| !lower.contains(&f.trim().to_lowercase()));
-    } else if !settings.tun_process_filter.iter().any(|f| {
-        let f = f.trim().to_lowercase();
-        !f.is_empty() && name.to_lowercase().contains(&f)
-    }) {
-        settings.tun_process_filter.push(name.to_string());
     }
-    let n = settings.tun_process_filter.len();
-    drop(settings);
-    crate::proxy_ctrl::save_settings(&shared.settings.lock().unwrap().clone());
-    shared.set_status(format!(
-        "{} {} ({} hijacked)",
-        if currently_hijacked {
-            "Stopped hijacking"
-        } else {
-            "Hijacking"
-        },
-        name,
-        n
-    ));
+    settings.tun_process_filter.len()
 }
 
 fn show_options(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
@@ -1771,4 +1788,49 @@ fn show_options(ui: &mut egui::Ui, shared: &Arc<SharedState>, p: &mut ProxyUi) {
         });
         ui.add_space(8.0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_hijack_toggle_semantics() {
+        let mut settings = crate::state::ProxySettings::default();
+
+        // Empty list hijacks nothing.
+        assert!(!crate::tun::process_matches(
+            &settings.tun_process_filter,
+            "chrome.exe"
+        ));
+
+        // Toggle ON (the post-flip state passed by the caller).
+        apply_hijack(&mut settings, "chrome.exe", true);
+        assert_eq!(settings.tun_process_filter, vec!["chrome.exe".to_string()]);
+        assert!(crate::tun::process_matches(
+            &settings.tun_process_filter,
+            "chrome.exe"
+        ));
+
+        // Toggling ON again must not duplicate the entry.
+        apply_hijack(&mut settings, "chrome.exe", true);
+        assert_eq!(settings.tun_process_filter.len(), 1);
+
+        // Toggle OFF removes every fragment matching the name.
+        apply_hijack(&mut settings, "chrome.exe", false);
+        assert!(settings.tun_process_filter.is_empty());
+        assert!(!crate::tun::process_matches(
+            &settings.tun_process_filter,
+            "chrome.exe"
+        ));
+
+        // A fragment entry is matched case-insensitively and cleared as well.
+        settings.tun_process_filter.push("Chrome".into());
+        assert!(crate::tun::process_matches(
+            &settings.tun_process_filter,
+            "chrome.exe"
+        ));
+        apply_hijack(&mut settings, "chrome.exe", false);
+        assert!(settings.tun_process_filter.is_empty());
+    }
 }
